@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  recall watch daemon — runs `recall watch` continuously to ingest
+  Codex and Cursor sessions on a timer. (Claude Code is already covered by
+  the Stop hook in ~/.claude/settings.json.) Skip installing this if you
+  only use Claude Code.
+
+  Install via `make watch-install` (substitutes __HOME__ for $HOME at install
+  time and copies into ~/Library/LaunchAgents/), then `launchctl load` it.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.fantazm.recall.watch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/recall</string>
+        <string>watch</string>
+        <string>--interval=30s</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/state/recall/watch.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/state/recall/watch.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

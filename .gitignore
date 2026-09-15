@@ -1,0 +1,23 @@
+# build
+/bin/
+/recall
+/release/
+
+# data / runtime
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.log
+/.cache/
+/tmp/
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# local config
+.env
+.env.local

@@ -1,0 +1,27 @@
+# systemd user unit for the Recall watch daemon (Linux).
+#
+# Installed by dist/setup.sh to ~/.config/systemd/user/recall-watch.service
+# with __BIN__ substituted for the absolute recall binary path. The watch
+# daemon polls Codex + Cursor session storage on a timer; Claude Code is
+# covered by its Stop hook and does not need polling.
+#
+# Manual install:
+#   sed "s|__BIN__|$HOME/.local/bin/recall|g" recall-watch.service.template \
+#     > ~/.config/systemd/user/recall-watch.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now recall-watch.service
+#
+# To keep it running while you're logged out: loginctl enable-linger $USER
+
+[Unit]
+Description=Recall watch daemon — ingest Codex + Cursor sessions on a timer
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=__BIN__ watch --interval=30s
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

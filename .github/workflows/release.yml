@@ -1,0 +1,314 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.0). Must already exist."
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  darwin-arm64:
+    name: build darwin-arm64
+    runs-on: macos-14   # Apple Silicon runner — required: CGO + Apple NaturalLanguage framework
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          CGO_ENABLED: '1'
+          GOOS: darwin
+          GOARCH: arm64
+        run: |
+          mkdir -p release
+          go build -trimpath -ldflags "-s -w -X main.version=${{ steps.ver.outputs.tag }}" \
+            -o release/recall ./cmd/recall
+
+      - name: Smoke test
+        run: |
+          ./release/recall version
+          ./release/recall --help >/dev/null
+
+      - name: Package binary-only tarball
+        id: pkg
+        run: |
+          cd release
+          NAME="recall-${{ steps.ver.outputs.tag }}-darwin-arm64"
+          tar -czf "${NAME}.tar.gz" recall
+          shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          shasum -a 256 recall > "recall.sha256"
+          echo "tarball=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha=${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          ls -la
+
+      # The "-full" tarball bundles the ONNX runtime dylib (~35 MiB) + the
+      # sentence-transformer model + tokenizer + config (~22 MiB) next to the
+      # `recall` binary. Targets managed-fleet deploys where the device cannot
+      # reach huggingface.co / github.com/microsoft at install time — e.g.
+      # corporate egress filtering, captive portals, or zero-trust networks
+      # where only the org's GitHub releases are allow-listed.
+      #
+      # We use the just-built `recall download-model` to populate the assets
+      # so they go through the same SHA256 pinning the binary will verify at
+      # load time. RECALL_HOME redirects the download destination to a
+      # workflow-relative directory, leaving the runner's filesystem clean.
+      - name: Download model + runtime assets (SHA256-verified, via recall)
+        env:
+          RECALL_HOME: ${{ github.workspace }}/bundled-assets
+        run: |
+          mkdir -p "$RECALL_HOME"
+          ./release/recall download-model
+          ls -la "$RECALL_HOME/runtime" "$RECALL_HOME/models/all-MiniLM-L6-v2"
+
+      - name: Package -full tarball (binary + bundled assets)
+        id: pkg_full
+        env:
+          RECALL_HOME: ${{ github.workspace }}/bundled-assets
+        run: |
+          NAME="recall-${{ steps.ver.outputs.tag }}-darwin-arm64-full"
+          STAGE="release/with-assets"
+          mkdir -p "$STAGE"
+          cp release/recall "$STAGE/"
+          cp -r "$RECALL_HOME/runtime" "$STAGE/"
+          cp -r "$RECALL_HOME/models"  "$STAGE/"
+          cd release
+          tar -czf "${NAME}.tar.gz" -C with-assets .
+          shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          echo "tarball=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha=${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          ls -la "${NAME}.tar.gz" "${NAME}.tar.gz.sha256"
+
+      - name: Upload to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release/${{ steps.pkg.outputs.tarball }}
+            release/${{ steps.pkg.outputs.sha }}
+            release/recall.sha256
+            release/${{ steps.pkg_full.outputs.tarball }}
+            release/${{ steps.pkg_full.outputs.sha }}
+
+  linux:
+    name: build linux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest      # native x64 — CGO builds with the runner's gcc
+          - arch: arm64
+            runner: ubuntu-24.04-arm   # native arm64 runner — no cross-toolchain needed
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          CGO_ENABLED: '1'   # ONNX dlopen bridge needs cgo; the runner's gcc handles it natively
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p release
+          go build -trimpath -ldflags "-s -w -X main.version=${{ steps.ver.outputs.tag }}" \
+            -o release/recall ./cmd/recall
+
+      - name: Smoke test
+        run: |
+          ./release/recall version
+          ./release/recall --help >/dev/null
+
+      - name: Package binary-only tarball
+        id: pkg
+        run: |
+          cd release
+          NAME="recall-${{ steps.ver.outputs.tag }}-linux-${{ matrix.arch }}"
+          tar -czf "${NAME}.tar.gz" recall
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          sha256sum recall > "recall-linux-${{ matrix.arch }}.sha256"
+          echo "tarball=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha=${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "binsha=recall-linux-${{ matrix.arch }}.sha256" >> "$GITHUB_OUTPUT"
+          ls -la
+
+      # -full tarball bundles the SHA256-pinned ONNX runtime (.so) + model +
+      # tokenizer next to the binary, for airgapped / egress-filtered fleets.
+      # Uses the just-built binary's own download-model so assets go through
+      # the same pinning the binary verifies at load time.
+      - name: Download model + runtime assets (SHA256-verified, via recall)
+        env:
+          RECALL_HOME: ${{ github.workspace }}/bundled-assets
+        run: |
+          mkdir -p "$RECALL_HOME"
+          ./release/recall download-model
+          ls -la "$RECALL_HOME/runtime" "$RECALL_HOME/models/all-MiniLM-L6-v2"
+
+      - name: Package -full tarball (binary + bundled assets)
+        id: pkg_full
+        env:
+          RECALL_HOME: ${{ github.workspace }}/bundled-assets
+        run: |
+          NAME="recall-${{ steps.ver.outputs.tag }}-linux-${{ matrix.arch }}-full"
+          STAGE="release/with-assets"
+          mkdir -p "$STAGE"
+          cp release/recall "$STAGE/"
+          cp -r "$RECALL_HOME/runtime" "$STAGE/"
+          cp -r "$RECALL_HOME/models"  "$STAGE/"
+          cd release
+          tar -czf "${NAME}.tar.gz" -C with-assets .
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          echo "tarball=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha=${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          ls -la "${NAME}.tar.gz" "${NAME}.tar.gz.sha256"
+
+      - name: Upload to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release/${{ steps.pkg.outputs.tarball }}
+            release/${{ steps.pkg.outputs.sha }}
+            release/${{ steps.pkg.outputs.binsha }}
+            release/${{ steps.pkg_full.outputs.tarball }}
+            release/${{ steps.pkg_full.outputs.sha }}
+
+  windows:
+    name: build windows-amd64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash   # the runner has Git-bash; keeps these steps close to the unix jobs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      # The ONNX bridge is cgo, so the build needs a C compiler. windows-latest
+      # doesn't put gcc on PATH by default. Install mingw-w64 via Chocolatey
+      # (preinstalled on the runner); it drops gcc on the machine PATH, which
+      # later steps pick up. cgo then finds `gcc` with no CC override.
+      - name: Install mingw-w64 (gcc for cgo)
+        shell: pwsh
+        run: choco install mingw --no-progress -y
+
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          CGO_ENABLED: '1'
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          which gcc && gcc --version | head -1   # fail loud if the toolchain isn't on PATH
+          mkdir -p release
+          go build -trimpath -ldflags "-s -w -X main.version=${{ steps.ver.outputs.tag }}" \
+            -o release/recall.exe ./cmd/recall
+
+      - name: Smoke test
+        run: |
+          ./release/recall.exe version
+          ./release/recall.exe --help >/dev/null
+
+      - name: Package binary-only zip
+        id: pkg
+        run: |
+          cd release
+          NAME="recall-${{ steps.ver.outputs.tag }}-windows-amd64"
+          7z a "${NAME}.zip" recall.exe >/dev/null
+          certutil -hashfile "${NAME}.zip" SHA256 | sed -n 2p | tr -d ' \r' > "${NAME}.zip.sha256"
+          certutil -hashfile recall.exe SHA256 | sed -n 2p | tr -d ' \r' > "recall-windows-amd64.exe.sha256"
+          echo "zip=${NAME}.zip" >> "$GITHUB_OUTPUT"
+          echo "sha=${NAME}.zip.sha256" >> "$GITHUB_OUTPUT"
+          echo "binsha=recall-windows-amd64.exe.sha256" >> "$GITHUB_OUTPUT"
+          ls -la
+
+      # -full zip bundles the SHA256-pinned onnxruntime.dll + model + tokenizer
+      # next to recall.exe, for airgapped / egress-filtered fleets. Uses the
+      # just-built binary's own download-model so assets go through the same
+      # pinning the binary verifies at load time.
+      - name: Download model + runtime assets (SHA256-verified, via recall)
+        env:
+          RECALL_HOME: ${{ github.workspace }}/bundled-assets
+        run: |
+          mkdir -p "$RECALL_HOME"
+          ./release/recall.exe download-model
+          ls -la "$RECALL_HOME/runtime" "$RECALL_HOME/models/all-MiniLM-L6-v2"
+
+      - name: Package -full zip (binary + bundled assets)
+        id: pkg_full
+        env:
+          RECALL_HOME: ${{ github.workspace }}/bundled-assets
+        run: |
+          NAME="recall-${{ steps.ver.outputs.tag }}-windows-amd64-full"
+          STAGE="release/with-assets"
+          mkdir -p "$STAGE"
+          cp release/recall.exe "$STAGE/"
+          cp -r "$RECALL_HOME/runtime" "$STAGE/"
+          cp -r "$RECALL_HOME/models"  "$STAGE/"
+          cd "$STAGE"
+          7z a "../../release/${NAME}.zip" . >/dev/null
+          cd ../..
+          certutil -hashfile "release/${NAME}.zip" SHA256 | sed -n 2p | tr -d ' \r' > "release/${NAME}.zip.sha256"
+          echo "zip=${NAME}.zip" >> "$GITHUB_OUTPUT"
+          echo "sha=${NAME}.zip.sha256" >> "$GITHUB_OUTPUT"
+          ls -la "release/${NAME}.zip"
+
+      - name: Upload to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release/${{ steps.pkg.outputs.zip }}
+            release/${{ steps.pkg.outputs.sha }}
+            release/${{ steps.pkg.outputs.binsha }}
+            release/${{ steps.pkg_full.outputs.zip }}
+            release/${{ steps.pkg_full.outputs.sha }}
